@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CROUTON (final_v3_actually_final)</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; font-family: "Comic Sans MS", Arial, sans-serif; }
+  #hud { position: absolute; top: 10px; left: 10px; color: #fff; font-size: 20px; text-shadow: 2px 2px #000; white-space: pre; }
+  .screen { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+            background: rgba(90, 25, 10, 0.88); color: #ffe9a8; text-align: center; padding: 0 16px; }
+  .screen h1 { font-size: 64px; margin: 0 0 10px 0; }
+  button { font-size: 22px; padding: 8px 24px; margin-top: 16px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="start" class="screen">
+  <h1>CROUTON</h1>
+  <p>you are a crouton. someone is eating the soup.<br>don't get eaten. survive 60 seconds until they're full.</p>
+  <p>WASD / arrows = paddle around<br>SPACE = soggy dash (has a cooldown)<br>red circle = SPOON INCOMING</p>
+  <button id="startBtn">start (being eaten)</button>
+</div>
+<div id="end" class="screen" style="display:none">
+  <h1 id="endTitle"></h1>
+  <p id="endMsg"></p>
+  <button id="againBtn">again</button>
+  <p>(or press R)</p>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// CROUTON - a game about soup. made this for fun instead of studying for my midterm
+const BOWL_R = 10, WIN_TIME = 60, SPOON_R = 1.8, SOUP_Y = 0.35;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xf3e3c3); // supposed to be a tablecloth
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(0, 17, 14);
+camera.lookAt(0, 0, 1);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 0.7);
+sun.position.set(5, 20, 8);
+scene.add(sun);
+
+const mat = c => new THREE.MeshLambertMaterial({ color: c });
+
+// bowl is just a fat cylinder, soup is a red disc on top. good enough
+const bowl = new THREE.Mesh(new THREE.CylinderGeometry(BOWL_R + 1, BOWL_R - 2, 3, 24), mat(0xffffff));
+bowl.position.y = -1.2;
+scene.add(bowl);
+const soup = new THREE.Mesh(new THREE.CylinderGeometry(BOWL_R, BOWL_R, 0.2, 24), mat(0xc8381e));
+soup.position.y = SOUP_Y - 0.1;
+scene.add(soup);
+const table = new THREE.Mesh(new THREE.BoxGeometry(60, 1, 60), mat(0x8a5a2b));
+table.position.y = -3.2;
+scene.add(table);
+
+// shared stuff for spoons
+const headGeo = new THREE.SphereGeometry(1, 12, 8);
+const handleGeo = new THREE.CylinderGeometry(0.2, 0.25, 9, 6);
+const spoonMat = mat(0xb8b8c0);
+const shadowGeo = new THREE.CylinderGeometry(SPOON_R, SPOON_R, 0.05, 20);
+const shadowMat = new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.45 });
+
+function makeSpoon() {
+  const g = new THREE.Group();
+  const head = new THREE.Mesh(headGeo, spoonMat);
+  head.scale.set(SPOON_R, 0.35, SPOON_R * 1.3);
+  g.add(head);
+  const handle = new THREE.Mesh(handleGeo, spoonMat);
+  handle.position.set(0, 3.2, -4.8); // eyeballed this until it looked spoon-ish
+  handle.rotation.x = -0.9;
+  g.add(handle);
+  return g;
+}
+
+function makeCrouton(color) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.6, 0.8), mat(color));
+  scene.add(m);
+  return { mesh: m, vx: 0, vz: 0, r: 0.55, alive: true, caught: null, wander: Math.random() * 6.28 };
+}
+
+const player = makeCrouton(0xf2b632);
+// googly eyes so you know which one is you
+const eye = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.14, 0.05), mat(0x000000));
+eye.position.set(-0.18, 0.1, 0.41);
+player.mesh.add(eye);
+const eye2 = eye.clone();
+eye2.position.x = 0.18;
+player.mesh.add(eye2);
+
+const croutons = [player];
+for (let i = 0; i < 5; i++) croutons.push(makeCrouton(0xb9802a));
+
+let spoons = [], state = 'menu', timeLeft = WIN_TIME, spawnT = 0, dashCd = 0;
+const keys = {};
+
+// beep boop sound (placeholder forever probably)
+let actx = null;
+function beep(f, d, type = 'square') {
+  if (!actx) return;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.value = f;
+  g.gain.setValueAtTime(0.08, actx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + d);
+  o.connect(g); g.connect(actx.destination);
+  o.start(); o.stop(actx.currentTime + d);
+}
+
+function reset() {
+  spoons.forEach(s => { scene.remove(s.g); scene.remove(s.shadow); });
+  spoons = [];
+  croutons.forEach((c, i) => {
+    const a = i / croutons.length * 6.28, r = i === 0 ? 0 : 5;
+    c.mesh.position.set(Math.cos(a) * r, 0.55, Math.sin(a) * r);
+    c.vx = c.vz = 0;
+    c.alive = true; c.caught = null; c.mesh.visible = true;
+  });
+  timeLeft = WIN_TIME; spawnT = 1.5; dashCd = 0;
+  state = 'play';
+  document.getElementById('end').style.display = 'none';
+}
+
+function spawnSpoon() {
+  const p = 1 - timeLeft / WIN_TIME; // how far into lunch we are, 0..1
+  let x, z;
+  if (Math.random() < 0.5) { // aim at the player. rude
+    x = player.mesh.position.x + (Math.random() - 0.5) * 2;
+    z = player.mesh.position.z + (Math.random() - 0.5) * 2;
+    const d = Math.hypot(x, z), maxD = BOWL_R - 1.5;
+    if (d > maxD) { x *= maxD / d; z *= maxD / d; }
+  } else {
+    const a = Math.random() * 6.28, r = Math.sqrt(Math.random()) * (BOWL_R - 1.5);
+    x = Math.cos(a) * r; z = Math.sin(a) * r;
+  }
+  const g = makeSpoon();
+  g.position.set(x, 14, z);
+  const shadow = new THREE.Mesh(shadowGeo, shadowMat);
+  shadow.position.set(x, SOUP_Y + 0.03, z);
+  scene.add(g); scene.add(shadow);
+  spoons.push({ g, shadow, x, z, t: 0, warn: 1.4 - 0.6 * p, phase: 'warn', caught: [], done: false });
+}
+
+function updateSpoons(dt) {
+  for (const s of spoons) {
+    s.t += dt;
+    if (s.phase === 'warn') {
+      const k = Math.min(s.t / s.warn, 1);
+      s.shadow.scale.set(0.3 + 0.7 * k, 1, 0.3 + 0.7 * k);
+      s.g.position.y = 14 - 5 * k;
+      if (k >= 1) { s.phase = 'dip'; s.t = 0; }
+    } else if (s.phase === 'dip') {
+      s.g.position.y = 9 - 8.6 * Math.min(s.t / 0.2, 1);
+      if (s.t >= 0.2) {
+        // CHOMP. anyone under the spoon gets scooped
+        for (const c of croutons) {
+          if (c.alive && !c.caught && Math.hypot(c.mesh.position.x - s.x, c.mesh.position.z - s.z) < SPOON_R + 0.2) {
+            c.caught = s; s.caught.push(c);
+          }
+        }
+        if (player.caught) state = 'caught';
+        beep(s.caught.length ? (player.caught === s ? 110 : 330) : 500, s.caught.length ? 0.3 : 0.05);
+        scene.remove(s.shadow);
+        s.phase = 'up'; s.t = 0;
+      }
+    } else {
+      s.g.position.y = 0.4 + s.t * 20;
+      s.caught.forEach(c => c.mesh.position.set(s.x, s.g.position.y + 0.4, s.z));
+      if (s.t > 0.7) s.done = true;
+    }
+  }
+  // clean up spoons that are done
+  spoons = spoons.filter(s => {
+    if (!s.done) return true;
+    scene.remove(s.g);
+    s.caught.forEach(c => { c.alive = false; c.mesh.visible = false; });
+    if (s.caught.includes(player)) endGame(false);
+    return false;
+  });
+}
+
+function physics(dt) {
+  const active = croutons.filter(c => c.alive && !c.caught);
+  for (const c of active) {
+    let ax = 0, az = 0;
+    const p = c.mesh.position;
+    if (c === player) {
+      if (keys.KeyW || keys.ArrowUp) az -= 1;
+      if (keys.KeyS || keys.ArrowDown) az += 1;
+      if (keys.KeyA || keys.ArrowLeft) ax -= 1;
+      if (keys.KeyD || keys.ArrowRight) ax += 1;
+      const l = Math.hypot(ax, az);
+      if (l) { ax /= l; az /= l; }
+      if (keys.Space && dashCd <= 0 && l) {
+        c.vx += ax * 12; c.vz += az * 12; dashCd = 1.5;
+        beep(220, 0.1, 'sawtooth');
+      }
+      ax *= 18; az *= 18;
+    } else {
+      // npc croutons just kinda drift around being dumb
+      c.wander += (Math.random() - 0.5) * 4 * dt;
+      ax = Math.cos(c.wander) * 5; az = Math.sin(c.wander) * 5;
+      c.mesh.rotation.y += dt * 0.5;
+    }
+    ax += -p.z * 0.3; az += p.x * 0.3; // the soup is being stirred
+    c.vx += ax * dt; c.vz += az * dt;
+    c.vx *= 1 - 2.5 * dt; c.vz *= 1 - 2.5 * dt; // soup is thick
+    p.x += c.vx * dt; p.z += c.vz * dt;
+    // bowl wall
+    const d = Math.hypot(p.x, p.z), maxD = BOWL_R - 0.6;
+    if (d > maxD) {
+      const nx = p.x / d, nz = p.z / d;
+      p.x = nx * maxD; p.z = nz * maxD;
+      const vn = c.vx * nx + c.vz * nz;
+      if (vn > 0) { c.vx -= 1.5 * vn * nx; c.vz -= 1.5 * vn * nz; }
+    }
+    p.y = 0.55 + Math.sin(performance.now() * 0.003 + c.r * 10 + croutons.indexOf(c)) * 0.05; // bob
+  }
+  if (Math.hypot(player.vx, player.vz) > 0.5) player.mesh.rotation.y = Math.atan2(player.vx, player.vz);
+
+  // crouton on crouton bonking
+  for (let i = 0; i < active.length; i++) {
+    for (let j = i + 1; j < active.length; j++) {
+      const a = active[i], b = active[j];
+      const dx = b.mesh.position.x - a.mesh.position.x, dz = b.mesh.position.z - a.mesh.position.z;
+      const d = Math.hypot(dx, dz);
+      if (d < a.r + b.r && d > 0.0001) {
+        const nx = dx / d, nz = dz / d, push = (a.r + b.r - d) / 2;
+        a.mesh.position.x -= nx * push; a.mesh.position.z -= nz * push;
+        b.mesh.position.x += nx * push; b.mesh.position.z += nz * push;
+        const rel = (a.vx - b.vx) * nx + (a.vz - b.vz) * nz;
+        if (rel > 0) { a.vx -= rel * nx; a.vz -= rel * nz; b.vx += rel * nx; b.vz += rel * nz; }
+      }
+    }
+  }
+}
+
+function endGame(won) {
+  state = 'over';
+  const lost = croutons.filter(c => c !== player && !c.alive).length;
+  document.getElementById('endTitle').textContent = won ? 'YOU SURVIVED LUNCH' : 'SCOOPED';
+  document.getElementById('endMsg').textContent = won
+    ? `they're full. you're soggy but alive. (${lost} of your crouton friends got eaten tho)`
+    : `you lasted ${(WIN_TIME - timeLeft).toFixed(1)} seconds. delicious.`;
+  document.getElementById('end').style.display = 'flex';
+  beep(won ? 880 : 90, 0.6, won ? 'triangle' : 'square');
+}
+
+const hud = document.getElementById('hud');
+const clock = new THREE.Clock();
+function loop() {
+  requestAnimationFrame(loop);
+  const dt = Math.min(clock.getDelta(), 0.05); // cap dt so tabbing out doesnt teleport stuff
+  if (state === 'play') {
+    timeLeft -= dt; dashCd -= dt; spawnT -= dt;
+    if (spawnT <= 0) { spawnSpoon(); spawnT = 2.2 - 1.5 * (1 - timeLeft / WIN_TIME); }
+    if (timeLeft <= 0) { timeLeft = 0; endGame(true); }
+  }
+  if (state === 'play' || state === 'caught') { physics(dt); updateSpoons(dt); }
+  if (state !== 'menu') {
+    const friends = croutons.filter(c => c !== player && c.alive).length;
+    hud.textContent = `lunch ends in: ${timeLeft.toFixed(1)}s\ndash: ${dashCd > 0 ? 'recharging...' : 'READY'}\nother croutons: ${friends}`;
+  }
+  renderer.render(scene, camera);
+}
+
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  if (e.code === 'KeyR' && state === 'over') reset();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; }); // stops keys getting stuck
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+document.getElementById('startBtn').onclick = e => {
+  e.target.blur(); // otherwise space presses the button lol
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  document.getElementById('start').style.display = 'none';
+  reset();
+};
+document.getElementById('againBtn').onclick = e => { e.target.blur(); reset(); };
+loop();
+</script>
+</body>
+</html>
